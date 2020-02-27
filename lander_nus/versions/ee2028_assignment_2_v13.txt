@@ -1,0 +1,345 @@
+#include <stdio.h>
+#include <math.h>
+
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_i2c.h"
+#include "lpc17xx_ssp.h"
+#include "lpc17xx_timer.h"
+
+#include "joystick.h"
+#include "pca9532.h"
+#include "acc.h"
+#include "oled.h"
+#include "rgb.h"
+#include "led7seg.h"
+#include "temp.h"
+#include "light.h"
+
+#define HALF_SECOND 500
+#define ONE_SECOND 1000
+#define FIVE_SECONDS 5000
+
+#define LIGHT_THRESHOLD 30
+#define TILT_THRESHOLD 30
+#define BATTERY_THRESHOLD 12.5
+#define DISCHARGE RATIO 0.875
+#define CHARGE RATIO 1.0625
+
+volatile uint8_t sw3_flag = 0;
+volatile uint8_t toggle_flag = 0;
+volatile uint8_t nav_init = 0;
+volatile uint8_t explore_flag = 0;
+volatile uint32_t temp_value;
+/*======= DEFINE BATTERY RATINGS =======*/
+volatile uint32_t energy_reading = 0xFFFF;
+volatile float power_percentage = 100;
+/*======================================*/
+
+volatile uint32_t msTicks, msTicks_half, msTicks_one;
+
+// Begin Protocol Initialization
+
+static void init_GPIO(void) {
+
+	PINSEL_CFG_Type PinCfg;
+
+	// Initialize RED RGB
+	PinCfg.Portnum = 2;
+	PinCfg.Pinnum = 0;
+	PINSEL_ConfigPin(&PinCfg);
+	GPIO_SetDir(2, 2<<0, 1);
+
+	// Initialize BLUE RGB
+	PinCfg.Portnum = 0;
+	PinCfg.Pinnum = 26;
+	PINSEL_ConfigPin(&PinCfg);
+	GPIO_SetDir(0, 0<<26, 1);
+
+	// Initialize GREEN RGB
+	PinCfg.Portnum = 2;
+	PinCfg.Pinnum = 1;
+	PINSEL_ConfigPin(&PinCfg);
+	GPIO_SetDir(2, 2<<1, 1);
+}
+
+static void init_ssp(void)
+{
+	SSP_CFG_Type SSP_ConfigStruct;
+	PINSEL_CFG_Type PinCfg;
+
+	/*
+	 * Initialize SPI pin connect
+	 * P0.7 - SCK;
+	 * P0.8 - MISO
+	 * P0.9 - MOSI
+	 * P2.2 - SSEL - used as GPIO
+	 */
+	PinCfg.Funcnum = 2;
+	PinCfg.OpenDrain = 0;
+	PinCfg.Pinmode = 0;
+	PinCfg.Portnum = 0;
+	PinCfg.Pinnum = 7;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 8;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 9;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Funcnum = 0;
+	PinCfg.Portnum = 2;
+	PinCfg.Pinnum = 2;
+	PINSEL_ConfigPin(&PinCfg);
+
+	SSP_ConfigStructInit(&SSP_ConfigStruct);
+
+	// Initialize SSP peripheral with parameter given in structure above
+	SSP_Init(LPC_SSP1, &SSP_ConfigStruct);
+
+	// Enable SSP peripheral
+	SSP_Cmd(LPC_SSP1, ENABLE);
+}
+
+static void init_i2c(void)
+{
+	PINSEL_CFG_Type PinCfg;
+
+	/* Initialize I2C2 pin connect */
+	PinCfg.Funcnum = 2;
+	PinCfg.Pinnum = 10;
+	PinCfg.Portnum = 0;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 11;
+	PINSEL_ConfigPin(&PinCfg);
+
+	// Initialize I2C peripheral
+	I2C_Init(LPC_I2C2, 100000);
+
+	/* Enable I2C1 operation */
+	I2C_Cmd(LPC_I2C2, ENABLE);
+}
+
+// End Protocol Initialization
+
+// Initialize Handler Initialization
+
+void EINT3_IRQHandler(void) {
+	// Determine whether GPIO Interrupt P2.10 has occurred, SW3
+	if (((LPC_GPIOINT -> IO2IntStatR >> 10) & 0x1) && toggle_flag == 0) {
+		int tog = 0;
+		sw3_flag = 1;
+        // Clear GPIO Interrupt P0.4
+        LPC_GPIOINT->IO2IntClr = 1<<10;
+        while (tog < 11) {
+            if (msTicks - msTicks_one <= ONE_SECOND && ((LPC_GPIOINT -> IO2IntStatR >> 10) & 0x1)) {
+            	msTicks_one = msTicks;
+    			LPC_GPIOINT->IO2IntClr = 1<<10;
+    			toggle_flag = 1;
+    			sw3_flag = 0;
+            }
+            tog++;
+        }
+	}
+}
+
+void SysTick_Handler(void) {
+	//events happening in frequency MHz
+	msTicks++;
+}
+
+uint32_t getTick(void) {
+	return msTicks;
+}
+
+// End Handler Initialization
+
+void prototyper(void) { // Current: EXPLORING MODE
+
+	// DISPLAY E ON SEGMENT_DISPLAY: 7-segment LED display
+	led7seg_setChar('E', FALSE);
+
+	// Only show blue LED
+	GPIO_ClearValue(2, 1 << 0); // clear red LED;
+	GPIO_SetValue(0, 1 << 26); // activate blue LED;
+
+	// GRAPHICS_DISPLAY: 96x64 White OLED
+	oled_clearScreen(OLED_COLOR_BLACK);
+	oled_putString(5, 5, (uint8_t *)"EXPLORING", OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+	oled_putString(5, 15, (uint8_t *)"Temperature: ", OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+	oled_putString(5, 10, (uint8_t *)"Battery: ", OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+
+	// Set up variables for TEMPERATURE_SENSOR: MAX6576
+	uint8_t display_temp[40] = {};
+
+	// LED_ARRAY: PCA9532 Port Expander
+	pca9532_setLeds(initial_reading, 0xFFFF);
+	uint8_t display_battery[40] = {};
+
+	uint32_t counter_ten = 0;
+
+	// ONCE EVERY 10 SECONDS, DRAIN BATTERY
+	while(counter_ten < 10) {
+
+		if (msTicks - msTicks_one >= ONE_SECOND) {
+			msTicks_one = msTicks;
+			temp_value = temp_read();
+			sprintf(display_temp, "%2.2f", temp_value/10.0);
+			oled_putString(15, 15, display_temp, OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+			counter_ten++;
+		}
+
+		if (counter_ten == 10) {
+			counter_ten = counter_ten % 10;
+			initial_reading = initial_reading >> 0x0001; // shift LED light activation by 1 bit to the right.
+			pca9532_setLeds(initial_reading, 0xFFFF); // assign reading
+			power_percentage = power_percentage * DISCHARGE_RATIO; // follow geometric series equation.
+			sprintf(display_battery, "%2.2f", power_percentage);
+			oled_putString(15, 15, display_battery, OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+		}
+	}
+}
+
+int main (void) {
+
+	// Protocol initialization
+    init_GPIO();
+    init_ssp();
+    init_i2c();
+
+    /* RGB_LED initialization */
+    rgb_init();
+    GPIO_ClearValue(2, 1<<0); // 	clear red LED
+    GPIO_ClearValue(0, 1<<26); // 	clear blue LED
+
+    /* SEGMENT_DISPLAY: 7-segment LED display initialization */
+    led7seg_init();
+
+    /* GRAPHICS_DISPLAY: 96x64 White OLED */
+    oled_init();
+    oled_clearScreen(OLED_COLOR_BLACK);
+
+    /* LIGHT_SENSOR: ISL29003 with LIGHT_RANGE_4000 initialization*/
+    light_enable();
+
+    /* LED_ARRAY: PCA9532 Port Expander initialization*/
+    pca9532_init();
+
+	/* TEMPERATURE_SENSOR: MAX6576 initialization */
+	temp_init(getTick);
+
+    /* Tick Initialization */
+    msTicks_half = msTicks;
+    msTicks_one = msTicks;
+
+    /* Interrupt Initialization and Enabling */
+    SysTick_Config(SystemCoreClock/1000);
+    LPC_GPIOINT -> IO2IntEnR |= 1 << 10; //		Enable GPIO Interrupt P2.10, or SW3
+    NVIC_EnableIRQ(EINT3_IRQn); //				Enable EINT3 interrupt
+
+    oled_putString(5, 5, (uint8_t *)"Orbiting Mode. Press SW3 to Land", OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+
+    /*=======================*/
+    /*		TOGGLE MODE      */
+    /*=======================*/
+    while (nav_init == FALSE) {
+
+    	if (toggle_flag == 1) {
+    		volatile uint8_t blue_t = 0;
+    		volatile uint8_t counter_five = 0;
+    		char seg_bit = '5';
+
+    		// GRAPHICS_DISPLAY
+    		oled_clearScreen(OLED_COLOR_BLACK);
+    		oled_putString(5, 5, (uint8_t *)"ENTERING LANDING MODE", OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+
+    		// Initialize LED 7 segment as '5'
+    		led7seg_setChar('5', FALSE);
+
+    		while (counter_five < 5) {
+
+    			// BLINK_BLUE
+    			if (msTicks - msTicks_half >= HALF_SECOND) {
+    				msTicks_half = msTicks;
+    				if (blue_t % 2 == 0) {
+    					GPIO_SetValue(0, 1 << 26); // activate blue LED
+    				}
+    				else {
+    					GPIO_ClearValue(0, 1<<26); // clear blue LED
+    				}
+    				blue_t++;
+    			}
+
+    			// SEGMENT_DISPLAY
+    			if (msTicks - msTicks_one >= ONE_SECOND) {
+    				msTicks_one = msTicks;
+    				counter_five++;
+    			}
+    			sprintf(seg_bit, "%d", (5-counter_five));
+    			led7seg_setChar(seg_bit, FALSE);
+
+    		}
+    		GPIO_ClearValue(0, 1<<26);
+    	}
+    	nav_init = TRUE;
+    }
+
+    /*========================*/
+    /*		LANDING MODE      */
+    /*========================*/
+
+    if (nav_init == TRUE && explore_flag == 0) {
+
+    	// DISPLAY L ON SEGMENT_DISPLAY: 7-segment LED display
+    	led7seg_setChar('L', FALSE);
+
+    	// GRAPHICS_DISPLAY: 96x64 White OLED
+    	oled_clearScreen(OLED_COLOR_BLACK);
+    	oled_putString(5, 5, (uint8_t *)"LANDING", OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+    	oled_putString(10, 10, (uint8_t *)"Acceleration: ", OLED_COLOR_WHITE, OLED_COLOR_BLACK);
+
+    	uint32_t counter_half = 0;
+
+    	while(light_read() > LIGHT_THRESHOLD) {
+
+    		// ALTERNATE_BLINK
+    		if (msTicks - msTicks_half >= HALF_SECOND) {
+    			msTicks_half = msTicks;
+    			if (counter_half % 2 == 0) {
+    				GPIO_SetValue(0, 1 << 26); // activate blue LED
+    				GPIO_ClearValue(2, 1 << 0); // clear red LED
+    			}
+    			else {
+    				GPIO_ClearValue(0, 1<<26); // clear blue LED
+    				GPIO_SetValue(2, 1 << 0); // activate red LED
+    			}
+    			counter_half++;
+    		}
+
+    		// PUT ACCELEROMETER CODE HERE
+    	}
+
+    	if (light_read() < LIGHT_THRESHOLD) {
+    		explore_flag = 1;
+    	}
+    }
+
+    /*============================*/
+    /*		EXPLORINING MODE      */
+    /*============================*/
+
+    else if (nav_init == TRUE && explore_flag == 1) {
+
+    }
+}
+
+// place check fail code here (already done) //
+
+void check_failed(uint8_t *file, uint32_t line)
+{
+	/* User can add his own implementation to report the file name and line number,
+	 ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+
+	/* Infinite loop */
+	while(1);
+}
+
+///////////////////////////////////////////////

@@ -1,0 +1,119 @@
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_i2c.h"
+#include "lpc17xx_ssp.h"
+#include "lpc17xx_timer.h"
+
+#include "joystick.h"
+#include "pca9532.h"
+#include "acc.h"
+#include "oled.h"
+#include "rgb.h"
+
+static void drawOled(uint8_t joyState)
+{
+    static int wait = 0;
+    static uint8_t currX = 48;
+    static uint8_t currY = 32;
+    static uint8_t lastX = 0;
+    static uint8_t lastY = 0;
+
+    if ((joyState & JOYSTICK_CENTER) != 0) {
+        oled_clearScreen(OLED_COLOR_BLACK);
+        return;
+    }
+
+    if (wait++ < 3)
+        return;
+
+    wait = 0;
+
+    if ((joyState & JOYSTICK_UP) != 0 && currY > 0) {
+        currY--;
+    }
+
+    if ((joyState & JOYSTICK_DOWN) != 0 && currY < OLED_DISPLAY_HEIGHT-1) {
+        currY++;
+    }
+
+    if ((joyState & JOYSTICK_RIGHT) != 0 && currX < OLED_DISPLAY_WIDTH-1) {
+        currX++;
+    }
+
+    if ((joyState & JOYSTICK_LEFT) != 0 && currX > 0) {
+        currX--;
+    }
+
+    if (lastX != currX || lastY != currY) {
+        oled_putPixel(currX, currY, OLED_COLOR_WHITE);
+        lastX = currX;
+        lastY = currY;
+    }
+}
+
+int main(void) {
+	int32_t xoff = 0;
+	int32_t yoff = 0;
+	int32_t zoff = 0;
+
+	int8_t x = 0;
+	int8_t y = 0;
+	int8_t z = 0;
+	uint8_t dir = 1;
+	uint8_t wait = 0;
+
+	uint8_t state = 0;
+
+	uint8_t btn1 = 1;
+
+	joystick_init();
+	acc_init();
+	oled_init();
+
+	oled_clearScreen(OLED_COLOR_BLACK);
+	
+	/*
+	* Assume base board in zero-g position when reading first value.
+	*/
+	acc_read(&x, &y, &z);
+	xoff = 0-x;
+	yoff = 0-y;
+ 	zoff = 64-z;
+
+       /* ####### Accelerometer and LEDs  ###### */
+        /* # */
+
+        acc_read(&x, &y, &z);
+        x = x+xoff;
+        y = y+yoff;
+        z = z+zoff;
+
+        if (y < 0) {
+            dir = 1;
+            y = -y;
+        }
+        else {
+            dir = -1;
+        }
+
+        if (y > 1 && wait++ > (40 / (1 + (y/10)))) {
+            moveBar(1, dir);
+            wait = 0;
+        }
+
+
+        /* # */
+        /* ############################################# */
+
+
+        /* ####### Joystick and OLED  ###### */
+        /* # */
+
+        state = joystick_read();
+        if (state != 0)
+            drawOled(state);
+
+        /* # */
+        /* ############################################# */
+
+}

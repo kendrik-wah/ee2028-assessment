@@ -1,0 +1,31 @@
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_i2c.h"
+#include "lpc17xx_ssp.h"
+#include "lpc17xx_timer.h"
+
+#include "joystick.h"
+#include "pca9532.h"
+#include "acc.h"
+#include "oled.h"
+#include "rgb.h"
+
+static uint8_t barPos = 2;
+
+static void moveBar(uint8_t steps, uint8_t dir)
+{
+    uint16_t ledOn = 0;
+
+    if (barPos == 0)
+        ledOn = (1 << 0) | (3 << 14);
+    else if (barPos == 1)
+        ledOn = (3 << 0) | (1 << 15);
+    else
+        ledOn = 0x07 << (barPos-2);
+
+    barPos += (dir*steps);
+    barPos = (barPos % 16);
+
+    pca9532_setLeds(ledOn, 0xffff);
+}
+

@@ -1,0 +1,120 @@
+#include <stdio.h>
+#include <math.h>
+
+#include "lpc17xx.h"
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_i2c.h"
+#include "lpc17xx_ssp.h"
+#include "lpc17xx_timer.h"
+
+#include "joystick.h"
+#include "pca9532.h"
+#include "acc.h"
+#include "oled.h"
+#include "rgb.h"
+#include "led7seg.h"
+#include "temp.h"
+#include "light.h"
+
+volatile uint32_t msTicks;
+
+static void init_i2c(void)
+{
+	PINSEL_CFG_Type PinCfg;
+
+	/* Initialize I2C2 pin connect */
+	PinCfg.Funcnum = 2;
+	PinCfg.Portnum = 0;
+	PinCfg.Pinnum = 10;
+	PINSEL_ConfigPin(&PinCfg);
+	PinCfg.Pinnum = 11;
+	PINSEL_ConfigPin(&PinCfg);
+
+	// Initialize I2C peripheral
+	I2C_Init(LPC_I2C2, 100000);
+
+	/* Enable I2C1 operation */
+	I2C_Cmd(LPC_I2C2, ENABLE);
+}
+
+static void init_GPIO(void)
+{
+	// Initialize button SW4
+	PINSEL_CFG_Type PinCfg;
+	PinCfg.Funcnum = 0;
+	PinCfg.OpenDrain = 0;
+	PinCfg.Pinmode = 0;
+	PinCfg.Portnum = 1;
+	PinCfg.Pinnum = 31;
+	PINSEL_ConfigPin(&PinCfg);
+	GPIO_SetDir(1, 1<<31, 0);
+}
+
+uint32_t initial_reading = 0xFFFF;
+float power = 100;
+float discharge_percentage_remainder = 0.875;
+float charge_percentage_current = 1.0625;
+
+uint32_t discharge_time_delay = 10000;
+
+void discharge_protocol(void) {
+
+	printf("discharging\n");
+	Timer0_Wait(discharge_time_delay); // wait 10 seconds
+
+	initial_reading = initial_reading >> 0x0001; // shift LED light activation by 1 bit to the right.
+	pca9532_setLeds(initial_reading, 0xFFFF); // assign reading
+
+	power = power * discharge_percentage_remainder; // follow geometric series equation.
+	printf("current_power: %4f\n", power);
+}
+
+void charge_protocol(void) {
+
+	power = power * charge_percentage_current;
+	printf("commence charge\n");
+
+	initial_reading = 7.1681*log(power) - 16.842;
+	pca9532_setLeds(initial_reading, 0xFFFF);
+	printf("current power: %.4f\n", power);
+
+}
+
+int main(void) {
+
+	uint8_t sw4 = 1;
+
+	init_i2c();
+	init_GPIO();
+
+	// Enable LED array
+	pca9532_init();
+	// Initialize 16 bits light up
+	pca9532_setLeds(initial_reading, 0xFFFF);
+
+	while(1) {
+
+    	sw4 = (GPIO_ReadValue(1) >> 31) & 0x01;
+
+        if (sw4 == 0) {
+            charge_protocol(); // May consider the use of EINT3 interrupt to charge instead. Existing methods make it impractical.
+            if (power > 100) {
+            	power = 100;
+            }
+        }
+
+		if (power > 12.5) {
+			discharge_protocol();
+		}
+	}
+}
+
+void check_failed(uint8_t *file, uint32_t line)
+{
+	/* User can add his own implementation to report the file name and line number,
+	 ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+
+	/* Infinite loop */
+	while(1);
+}

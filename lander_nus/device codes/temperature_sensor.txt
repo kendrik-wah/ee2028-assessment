@@ -1,0 +1,52 @@
+#include "stdio.h"
+
+#include "lpc17xx.h"
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_i2c.h"
+#include "lpc17xx_ssp.h"
+#include "lpc17xx_timer.h"
+
+#include "joystick.h"
+#include "pca9532.h"
+#include "acc.h"
+#include "oled.h"
+#include "rgb.h"
+#include "led7seg.h"
+#include "temp.h"
+
+volatile uint32_t msTicks;
+
+void SysTick_Handler(void) {
+	//events happening in frequency MHz
+	msTicks++;
+}
+
+uint32_t getTick(void) {
+	return msTicks;
+}
+
+int main(void) {
+
+	SysTick_Config(SystemCoreClock/1000);
+	temp_init(getTick);
+
+	uint32_t my_temp_value;
+	while(1)
+	{
+		my_temp_value = temp_read();
+		printf("Temperature: %2.2f degrees \n", my_temp_value/10.0);
+
+		Timer0_Wait(1);
+	}
+
+}
+
+void check_failed(uint8_t *file, uint32_t line)
+{
+	/* User can add his own implementation to report the file name and line number,
+	 ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+
+	/* Infinite loop */
+	while(1);
+}
